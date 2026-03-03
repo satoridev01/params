@@ -1,0 +1,65 @@
+# satori run params.yml --repo account/repository --output
+settings:
+  name: "pyspector params"
+  image: satori
+
+install:
+  - apt install -qy cargo rustc
+  - pip install -r requirements.txt
+  - pip install .
+
+# Option<String>
+PATH1:
+  - - "./file.txt1"
+# Option<String>
+URL2:
+  - - "https://example.com2"
+# URL of a public GitHub/GitLab repository to clone and scan.; str
+REPO_URL3:
+  - - "https://example.com3"
+# Path to a pyspector.toml config file.; click.Path(exists=True, path_type=Path)
+CONFIG_PATH4:
+  - - "./file.txt4"
+# Path to write the report to.; click.Path(path_type=Path)
+OUTPUT_FILE5:
+  - - "./file.txt5"
+# Format of the report.; click.Choice(['console', 'json', 'sarif', 'html'])
+REPORT_FORMAT6:
+  - - "console"
+# Minimum severity level to report.; click.Choice(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'])
+SEVERITY_LEVEL7:
+  - - "LOW"
+# Load and execute a plugin (can be specified multiple times)
+PLUGINS8:
+  - - "value8"
+# Path to plugin configuration JSON file; click.Path(exists=True, path_type=Path)
+PLUGIN_CONFIG_FILE9:
+  - - "./file.txt9"
+# click.Path(exists=True, readable=True, path_type=Path)
+REPORT_FILE10:
+  - - "./file.txt10"
+PLUGIN_NAME11:
+  - - "example11"
+# click.Path(exists=True, path_type=Path)
+PLUGIN_FILE12:
+  - - "./file.txt12"
+# Custom name for the plugin
+NAME13:
+  - - "example13"
+
+executions:
+  assertReturnCode: 0
+  ScanRequest:
+    - pyspector-api --path=${{PATH1}} --url=${{URL2}}
+  scan:
+    - pyspector scan ${{PATH1}} --url=${{REPO_URL3}} --config=${{CONFIG_PATH4}} --output=${{OUTPUT_FILE5}} --format=${{REPORT_FORMAT6}} --severity=${{SEVERITY_LEVEL7}} --plugin=${{PLUGINS8}} --plugin-config=${{PLUGIN_CONFIG_FILE9}} --ai --list-plugins --supply-chain --wizard
+  triage:
+    - pyspector triage ${{REPORT_FILE10}}
+  plugin_trust:
+    - pyspector plugin trust ${{PLUGIN_NAME11}}
+  plugin_info:
+    - pyspector plugin info ${{PLUGIN_NAME11}}
+  plugin_install:
+    - pyspector plugin install ${{PLUGIN_FILE12}} --name=${{NAME13}} --trust
+  plugin_remove:
+    - pyspector plugin remove ${{PLUGIN_NAME11}} --force

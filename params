@@ -1,0 +1,1319 @@
+#!/usr/bin/env python3
+"""
+params - Extract CLI parameters from source code and output Satori CI playbook format.
+
+Scans a project directory for Python and Rust source files, identifies
+command-line parameter patterns (click, argparse, clap, serde request structs),
+and generates variable definitions with mockup values plus execution commands
+using ${{VAR}} references.
+
+Usage: params ./projectdirectory
+"""
+
+import sys
+import re
+import json
+from pathlib import Path
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _extract_balanced(text, key):
+    """Extract value for key=value where value may contain balanced parens."""
+    pattern = re.compile(rf"{key}\s*=\s*")
+    m = pattern.search(text)
+    if not m:
+        return None
+    start = m.end()
+    if start >= len(text):
+        return None
+    if text[start] in ("'", '"'):
+        q = text[start]
+        end = text.index(q, start + 1) + 1
+        return text[start + 1 : end - 1]
+    depth = 0
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if ch in ("(", "[", "{"):
+            depth += 1
+        elif ch in (")", "]", "}"):
+            if depth == 0:
+                break
+            depth -= 1
+        elif ch == "," and depth == 0:
+            break
+        i += 1
+    return text[start:i].strip()
+
+
+def _find_balanced_call(source, start_pos):
+    """From an opening '(' at start_pos, find the matching ')'. Return full text."""
+    depth = 1
+    i = start_pos + 1
+    while i < len(source) and depth > 0:
+        ch = source[i]
+        if ch in ("'", '"'):
+            q = ch
+            i += 1
+            while i < len(source) and source[i] != q:
+                if source[i] == "\\":
+                    i += 1
+                i += 1
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        i += 1
+    return source[start_pos:i]
+
+
+# ─── Python: click — grouped by function ─────────────────────────────────────
+
+def extract_click_commands(source, filepath):
+    """Extract click commands with their associated options and arguments,
+    grouped by the function they decorate."""
+    commands = []
+
+    # Find all function definitions preceded by click decorators
+    # Strategy: find each 'def funcname(...)' and look backwards for decorators
+    func_pattern = re.compile(r"^def\s+(\w+)\s*\(", re.MULTILINE)
+
+    for func_m in func_pattern.finditer(source):
+        func_name = func_m.group(1)
+        func_pos = func_m.start()
+
+        # Scan backwards from the def to collect all @click.* decorators
+        # Find the block of decorators above this def
+        before = source[:func_pos].rstrip()
+        decorator_lines = []
+        lines = before.split("\n")
+
+        # Walk backwards collecting decorator lines (and continuation)
+        i = len(lines) - 1
+        while i >= 0:
+            line = lines[i].strip()
+            if line.startswith("@"):
+                # Collect this decorator (may span multiple lines)
+                dec_start = source.rfind(line, 0, func_pos)
+                if dec_start != -1 and ("@click." in line or ".command(" in line or ".group(" in line or ".option(" in line or ".argument(" in line):
+                    decorator_lines.append(dec_start)
+                i -= 1
+            elif not line or line.startswith("#"):
+                i -= 1
+            else:
+                break
+
+        if not decorator_lines:
+            continue
+
+        # Now parse each decorator
+        cmd_info = {
+            "func_name": func_name,
+            "command_name": None,
+            "command_type": None,
+            "help": None,
+            "options": [],
+            "arguments": [],
+            "file": filepath,
+        }
+
+        for dec_pos in sorted(decorator_lines):
+            # Find the opening paren
+            paren_pos = source.index("(", dec_pos)
+            decorator_text_full = source[dec_pos:dec_pos + (paren_pos - dec_pos)] + _find_balanced_call(source, paren_pos)
+
+            if "@click.option(" in decorator_text_full:
+                text = decorator_text_full
+                flags = re.findall(r"""['"](-[^\s'"]+)['"]""", text)
+
+                # Extract dest name: in click, it's derived from flags or
+                # an explicit 'name' positional arg before keyword args.
+                # Extract only the positional string args (before first keyword=)
+                paren_content = text[text.index("(") + 1:]
+                first_kw = re.search(r"\w+\s*=", paren_content)
+                positional_part = paren_content[:first_kw.start()] if first_kw else paren_content
+                positional_strs = re.findall(r"""['"]([^'"]+)['"]""", positional_part)
+                # dest is the first non-flag positional, or derived from longest flag
+                dest = None
+                for a in positional_strs:
+                    if not a.startswith("-"):
+                        dest = a
+                        break
+                if not dest and flags:
+                    # Derive from longest flag
+                    longest = max(flags, key=len).lstrip("-")
+                    dest = longest.replace("-", "_")
+
+                help_m = re.search(r"""help\s*=\s*['"]([^'"]+)['"]""", text)
+                is_flag_m = re.search(r"is_flag\s*=\s*True", text)
+                type_val = _extract_balanced(text, "type")
+                default_val = _extract_balanced(text, "default")
+                multiple_m = re.search(r"multiple\s*=\s*True", text)
+
+                cmd_info["options"].append({
+                    "kind": "option",
+                    "flags": flags,
+                    "dest": dest,
+                    "help": help_m.group(1).strip() if help_m else None,
+                    "is_flag": bool(is_flag_m),
+                    "type": type_val,
+                    "default": default_val,
+                    "multiple": bool(multiple_m),
+                })
+
+            elif "@click.argument(" in decorator_text_full:
+                text = decorator_text_full
+                name_m = re.search(r"""@click\.argument\(\s*['"](\w+)['"]""", text)
+                if not name_m:
+                    continue
+                name = name_m.group(1)
+                rest = text[name_m.end():]
+                type_val = _extract_balanced(rest, "type")
+                required_m = re.search(r"required\s*=\s*(True|False)", rest)
+
+                cmd_info["arguments"].append({
+                    "kind": "argument",
+                    "name": name,
+                    "type": type_val,
+                    "required": required_m.group(1) if required_m else None,
+                })
+
+            elif ".command(" in decorator_text_full:
+                text = decorator_text_full
+                help_m = re.search(r"""help\s*=\s*['"]([^'"]+)['"]""", text)
+                # Detect registered name: @group.command(name="xyz")
+                name_m = re.search(r"""name\s*=\s*['"](\w+)['"]""", text)
+                # Detect parent group: @parent_var.command(...)
+                parent_m = re.match(r"@(\w+)\.command\(", text)
+                cmd_info["command_type"] = "command"
+                cmd_info["command_name"] = name_m.group(1) if name_m else func_name
+                cmd_info["help"] = help_m.group(1).strip() if help_m else None
+                if parent_m and parent_m.group(1) != "click":
+                    cmd_info["parent_group"] = parent_m.group(1)
+
+            elif ".group(" in decorator_text_full:
+                text = decorator_text_full
+                help_m = re.search(r"""help\s*=\s*['"]([^'"]+)['"]""", text)
+                cmd_info["command_type"] = "group"
+                cmd_info["command_name"] = func_name
+                cmd_info["help"] = help_m.group(1).strip() if help_m else None
+
+        # Only include functions that have click params
+        if cmd_info["options"] or cmd_info["arguments"] or cmd_info["command_type"]:
+            commands.append(cmd_info)
+
+    # Resolve CLI names from add_command registrations
+    # e.g. cli.add_command(run_scan_command, name="scan")
+    cli_name_map = {}   # func_name -> registered CLI name
+    parent_map = {}     # func_name -> parent group func_name
+    group_funcs = set()
+
+    for m in re.finditer(
+        r"(\w+)\.add_command\(\s*(\w+)(?:\s*,\s*name\s*=\s*['\"](\w+)['\"])?\s*\)",
+        source,
+    ):
+        parent_group = m.group(1)
+        child_func = m.group(2)
+        registered_name = m.group(3)
+        if registered_name:
+            cli_name_map[child_func] = registered_name
+        parent_map[child_func] = parent_group
+
+    for cmd_info in commands:
+        if cmd_info.get("command_type") == "group":
+            group_funcs.add(cmd_info["func_name"])
+        # Also register parent from @parent.command() decorator
+        if cmd_info.get("parent_group") and cmd_info["func_name"] not in parent_map:
+            parent_map[cmd_info["func_name"]] = cmd_info["parent_group"]
+
+    def _resolve_cli_path(func_name, cmd_name):
+        # Use registered CLI name if available (from add_command)
+        parts = [cli_name_map.get(func_name, cmd_name)]
+        current = func_name
+        seen = set()
+        while current in parent_map and current not in seen:
+            seen.add(current)
+            parent = parent_map[current]
+            parent_cli = cli_name_map.get(parent, parent)
+            # If parent is the root group, skip it (binary name replaces it)
+            if parent in group_funcs and parent not in parent_map:
+                break
+            parts.append(parent_cli)
+            current = parent
+        parts.reverse()
+        return " ".join(parts)
+
+    for cmd_info in commands:
+        func_name = cmd_info["func_name"]
+        cmd_name = cmd_info.get("command_name") or func_name
+        cmd_info["cli_path"] = _resolve_cli_path(func_name, cmd_name)
+
+    return commands
+
+
+# ─── Python: argparse ─────────────────────────────────────────────────────────
+
+def _parse_add_argument(text):
+    """Parse a single .add_argument() call and return a param dict."""
+    flags = re.findall(r"""['"](-[^\s'"]+)['"]""", text)
+    positionals = re.findall(r"""['\"]([a-zA-Z]\w*)['\"]""", text)
+    help_m = re.search(r"""help\s*=\s*['"]([^'"]+)['"]""", text)
+    type_m = re.search(r"type\s*=\s*(\w+)", text)
+    default_m = re.search(r"default\s*=\s*([^,\)]+)", text)
+    action_m = re.search(r"""action\s*=\s*['"]([^'"]+)['"]""", text)
+    dest_m = re.search(r"""dest\s*=\s*['"]([^'"]+)['"]""", text)
+    # choices as tuple or list: choices=("html", "svg", "txt") or choices=["a", "b"]
+    choices_m = re.search(r"choices\s*=\s*[\(\[]((?:['\"][^'\"]*['\"],?\s*)+)[\)\]]", text)
+    # choices via get_args(SOMETHING)
+    choices_getargs_m = re.search(r"choices\s*=\s*get_args\(\s*(\w+)\s*\)", text)
+    # nargs
+    nargs_m = re.search(r"""nargs\s*=\s*['"]([^'"]+)['"]""", text)
+    # required
+    required_m = re.search(r"required\s*=\s*True", text)
+
+    is_flag = action_m and action_m.group(1) in ("store_true", "store_false", "count")
+    is_append = action_m and action_m.group(1) == "append"
+    is_version = action_m and action_m.group(1) == "version"
+
+    if is_version:
+        return None
+
+    if flags:
+        longest = max(flags, key=len).lstrip("-")
+        dest = dest_m.group(1) if dest_m else longest.replace("-", "_")
+    else:
+        dest = dest_m.group(1) if dest_m else (positionals[0] if positionals else None)
+
+    # Build type string for choices
+    type_str = type_m.group(1).strip() if type_m else None
+    if choices_m:
+        items = re.findall(r"""['"]([^'"]+)['"]""", choices_m.group(1))
+        if items:
+            type_str = "click.Choice([" + ", ".join(f"'{i}'" for i in items) + "])"
+    elif choices_getargs_m:
+        # We'll resolve Literal types later if possible
+        type_str = f"choices:{choices_getargs_m.group(1)}"
+
+    if is_append:
+        type_str = "list"
+
+    p = {
+        "kind": "argument" if not flags else "option",
+        "flags": flags if flags else [],
+        "dest": dest,
+        "name": positionals[0] if (not flags and positionals) else dest,
+        "help": help_m.group(1).strip() if help_m else None,
+        "type": type_str,
+        "default": default_m.group(1).strip() if default_m else None,
+        "is_flag": is_flag,
+    }
+    return p
+
+
+def _extract_add_arguments(source_section):
+    """Extract all .add_argument() calls from a source section."""
+    params = []
+    for m in re.finditer(r"\.add_argument\(", source_section):
+        start = m.start()
+        call_text = _find_balanced_call(source_section, m.end() - 1)
+        if call_text:
+            p = _parse_add_argument(call_text)
+            if p:
+                params.append(p)
+    return params
+
+
+def _resolve_literal_choices(all_sources, ref_name):
+    """Find Literal[...] or tuple definition for a choices reference."""
+    for source in all_sources:
+        # Literal["a", "b", "c"]
+        m = re.search(
+            rf'{ref_name}\s*=\s*Literal\[\s*((?:["\'][^"\']*["\'],?\s*)+)\]',
+            source,
+        )
+        if m:
+            items = re.findall(r"""['"]([^'"]+)['"]""", m.group(1))
+            if items:
+                return "click.Choice([" + ", ".join(f"'{i}'" for i in items) + "])"
+        # tuple of strings
+        m = re.search(
+            rf'{ref_name}\s*=\s*\(\s*((?:["\'][^"\']*["\'],?\s*)+)\)',
+            source,
+        )
+        if m:
+            items = re.findall(r"""['"]([^'"]+)['"]""", m.group(1))
+            if items:
+                return "click.Choice([" + ", ".join(f"'{i}'" for i in items) + "])"
+    return None
+
+
+def extract_argparse_commands(source, filepath):
+    """Extract argparse params from simple (non-class) patterns."""
+    # Skip files that use class-based command pattern
+    if re.search(r"class\s+\w+.*BaseCommand", source):
+        return []
+    # Skip files that only define shared ArgumentParser objects (not command parsers)
+    if re.search(r"^\w+\s*=\s*ArgumentParser\s*\(\s*add_help\s*=\s*False", source, re.MULTILINE):
+        return []
+
+    params = _extract_add_arguments(source)
+
+    if not params:
+        return []
+
+    options = [p for p in params if p["kind"] == "option"]
+    arguments = [p for p in params if p["kind"] == "argument"]
+
+    return [{
+        "func_name": "main",
+        "command_name": "main",
+        "command_type": "command",
+        "help": None,
+        "options": options,
+        "arguments": arguments,
+        "file": filepath,
+    }]
+
+
+def extract_argparse_class_commands(root):
+    """Extract argparse commands from class-based command patterns across all files.
+
+    Handles patterns like satori-cli where each command is a class with:
+        name = "xxx"
+        def register_args(self, parser): ...
+    """
+    root = Path(root).resolve()
+    py_files = sorted(root.rglob("*.py"))
+
+    # Read all sources
+    file_sources = {}
+    for path in py_files:
+        if any(part.startswith(".") for part in path.relative_to(root).parts):
+            continue
+        try:
+            file_sources[str(path)] = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+
+    all_sources = list(file_sources.values())
+
+    # Phase 1: Find all command classes
+    # class_info: {class_name: {name, params, file, subcommands_refs, options_refs, global_options_refs}}
+    class_info = {}
+    # Also find standalone ArgumentParser objects (shared parsers)
+    shared_parsers = {}  # var_name -> [params]
+    # Also find helper functions that add arguments
+    helper_funcs = {}  # func_name -> source_body
+
+    for filepath, source in file_sources.items():
+        # Find helper functions that add arguments to parsers
+        for fm in re.finditer(
+            r"def\s+(\w+)\s*\(\s*parser\s*(?::\s*ArgumentParser)?\s*\)",
+            source,
+        ):
+            func_name = fm.group(1)
+            # Find the function body
+            func_start = fm.start()
+            # Find body: from the colon after ) to the next def/class at same indent
+            body_start = source.find(":", fm.end()) + 1
+            # Find next function/class def at same or lower indent level
+            indent_m = re.match(r"(\s*)", source[func_start:])
+            base_indent = len(indent_m.group(1)) if indent_m else 0
+            body_end = len(source)
+            for next_m in re.finditer(r"\n(\s*)(?:def |class )", source[body_start:]):
+                if len(next_m.group(1)) <= base_indent:
+                    body_end = body_start + next_m.start()
+                    break
+            func_body = source[body_start:body_end]
+            if ".add_argument(" in func_body:
+                helper_funcs[func_name] = func_body
+
+        # Find standalone ArgumentParser objects: var = ArgumentParser(add_help=False)
+        for sm in re.finditer(
+            r"^(\w+)\s*=\s*ArgumentParser\s*\(\s*add_help\s*=\s*False\s*\)",
+            source,
+            re.MULTILINE,
+        ):
+            var_name = sm.group(1)
+            # Find add_argument calls on this var until next blank line or assignment
+            after = source[sm.end():]
+            # Collect lines that start with var_name.add_argument
+            section = []
+            for line in after.split("\n"):
+                stripped = line.strip()
+                if stripped.startswith(f"{var_name}.add_argument("):
+                    section.append(line)
+                elif stripped and not stripped.startswith(f"{var_name}.") and not stripped.startswith("#"):
+                    break
+                else:
+                    section.append(line)
+            section_text = "\n".join(section)
+            params = _extract_add_arguments(section_text)
+            if params:
+                shared_parsers[var_name] = params
+
+        # Find command classes
+        for cm in re.finditer(
+            r"class\s+(\w+)\s*\([^)]*(?:BaseCommand|ABC)[^)]*\)\s*:",
+            source,
+        ):
+            class_name = cm.group(1)
+            class_start = cm.end()
+
+            # Find end of class (next class/function at same indent or EOF)
+            indent_m = re.match(r"(\s*)", source[cm.start():])
+            base_indent = len(indent_m.group(1)) if indent_m else 0
+            class_end = len(source)
+            for next_m in re.finditer(r"\n(\s*)(?:class )", source[class_start:]):
+                if len(next_m.group(1)) <= base_indent:
+                    class_end = class_start + next_m.start()
+                    break
+            class_body = source[class_start:class_end]
+
+            # Extract name = "xxx"
+            name_m = re.search(r"""name\s*=\s*['"]([^'"]+)['"]""", class_body)
+            cmd_name = name_m.group(1) if name_m else class_name.lower()
+
+            # Extract subcommands = (FooCommand, BarCommand, ...)
+            sub_m = re.search(
+                r"subcommands\s*=\s*\(([\s\S]*?)\)", class_body
+            )
+            subcommand_refs = []
+            if sub_m:
+                subcommand_refs = re.findall(r"(\w+Command)\b", sub_m.group(1))
+
+            # Extract global_options = (var1, var2, ...)
+            gopt_m = re.search(
+                r"global_options\s*=\s*\(([\s\S]*?)\)", class_body
+            )
+            global_options_refs = []
+            if gopt_m:
+                global_options_refs = re.findall(r"(\w+)", gopt_m.group(1))
+
+            # Extract options = (var1, ...)
+            opt_m = re.search(
+                r"options\s*=\s*\(([^)]+)\)", class_body
+            )
+            options_refs = []
+            if opt_m:
+                options_refs = re.findall(r"(\w+)", opt_m.group(1))
+
+            # Find register_args method and extract params
+            reg_m = re.search(r"def\s+register_args\s*\(self.*?\)\s*:", class_body)
+            params = []
+            if reg_m:
+                reg_start = reg_m.end()
+                # Find end of method (next def at class indent + 4)
+                reg_end = len(class_body)
+                for next_m in re.finditer(r"\n(\s*)def\s+", class_body[reg_start:]):
+                    reg_end = reg_start + next_m.start()
+                    break
+                method_body = class_body[reg_start:reg_end]
+                params = _extract_add_arguments(method_body)
+
+                # Check for helper function calls like add_pagination_args(parser)
+                for hcall in re.finditer(r"(\w+)\s*\(\s*(?:parser|search_parser|download_parser|stop_parser|subparser)\s*\)", method_body):
+                    hname = hcall.group(1)
+                    if hname in helper_funcs and hname != "add_argument":
+                        params.extend(_extract_add_arguments(helper_funcs[hname]))
+
+            class_info[class_name] = {
+                "name": cmd_name,
+                "params": params,
+                "file": filepath,
+                "subcommand_refs": subcommand_refs,
+                "global_options_refs": global_options_refs,
+                "options_refs": options_refs,
+            }
+
+    if not class_info:
+        return []
+
+    # Phase 2: Find root command (has subcommands)
+    root_class = None
+    for cname, cinfo in class_info.items():
+        if cinfo["subcommand_refs"]:
+            root_class = cname
+            break
+
+    if not root_class:
+        return []
+
+    # Collect global options params
+    global_params = []
+    for ref in class_info[root_class].get("global_options_refs", []):
+        if ref in shared_parsers:
+            global_params.extend(shared_parsers[ref])
+
+    # Phase 3: Build commands for each subcommand
+    commands = []
+    for sub_ref in class_info[root_class]["subcommand_refs"]:
+        if sub_ref not in class_info:
+            continue
+        info = class_info[sub_ref]
+        cmd_name = info["name"]
+
+        # Merge params: command-specific options + shared parser options
+        all_params = list(info["params"])
+        for opt_ref in info.get("options_refs", []):
+            if opt_ref in shared_parsers:
+                all_params.extend(shared_parsers[opt_ref])
+
+        # Deduplicate params by dest (helper functions may be called multiple times for subparsers)
+        seen_dests = set()
+        deduped = []
+        for p in all_params:
+            d = p.get("dest")
+            if d and d in seen_dests:
+                continue
+            if d:
+                seen_dests.add(d)
+            deduped.append(p)
+        all_params = deduped
+
+        # Resolve choices:LITERAL_NAME references
+        for p in all_params:
+            if p.get("type") and p["type"].startswith("choices:"):
+                ref_name = p["type"].split(":", 1)[1]
+                resolved = _resolve_literal_choices(all_sources, ref_name)
+                if resolved:
+                    p["type"] = resolved
+
+        # Don't include global options (they're shared across all commands, not fuzzing targets)
+        # Filter out params that match global option dests
+        global_dests = {gp.get("dest") for gp in global_params}
+        all_params = [p for p in all_params if p.get("dest") not in global_dests]
+
+        if not all_params:
+            continue
+
+        options = [p for p in all_params if p["kind"] == "option"]
+        arguments = [p for p in all_params if p["kind"] == "argument"]
+
+        commands.append({
+            "func_name": sub_ref,
+            "command_name": cmd_name,
+            "command_type": "command",
+            "help": None,
+            "options": options,
+            "arguments": arguments,
+            "file": info["file"],
+        })
+
+    return commands
+
+
+# ─── Rust: clap ───────────────────────────────────────────────────────────────
+
+def extract_clap_commands(source, filepath):
+    commands = []
+
+    struct_pattern = re.compile(
+        r"#\[derive\([^)]*(?:Parser|Args|Subcommand)[^)]*\)\]"
+        r"((?:\s*#\[[^\]]*\])*)"
+        r"\s*(?:pub\s+)?struct\s+(\w+)\s*\{"
+        r"([^}]*)\}",
+        re.DOTALL,
+    )
+
+    for sm in struct_pattern.finditer(source):
+        struct_attrs = sm.group(1)
+        struct_name = sm.group(2)
+        body = sm.group(3)
+
+        about_m = re.search(r"""about\s*=\s*"([^"]+)""", struct_attrs)
+
+        options = []
+        field_pattern = re.compile(
+            r"((?:\s*(?:#\[(?:arg|command|clap)\([^\]]*\)\])\s*)*)"
+            r"\s*(?:pub\s+)?(\w+)\s*:\s*([^,\n]+)",
+            re.DOTALL,
+        )
+
+        for fm in field_pattern.finditer(body):
+            attrs = fm.group(1)
+            field_name = fm.group(2)
+            field_type = fm.group(3).strip().rstrip(",")
+
+            short_m = re.search(r"short\s*(?:=\s*'(.)')?", attrs)
+            long_m = re.search(r"""long\s*(?:=\s*"([^"]*)")?""", attrs)
+            help_m = re.search(r"""help\s*=\s*"([^"]+)""", attrs)
+            default_m = re.search(r"""default_value(?:_t)?\s*=\s*"?([^",\)]+)""", attrs)
+
+            flags = []
+            if short_m:
+                c = short_m.group(1) or field_name[0]
+                flags.append(f"-{c}")
+            if long_m:
+                l = long_m.group(1) or field_name.replace("_", "-")
+                flags.append(f"--{l}")
+            elif not short_m:
+                flags.append(f"--{field_name.replace('_', '-')}")
+
+            is_bool = field_type.strip() in ("bool", "Bool")
+
+            options.append({
+                "kind": "option",
+                "flags": flags,
+                "dest": field_name,
+                "name": field_name,
+                "type": field_type,
+                "help": help_m.group(1) if help_m else None,
+                "default": default_m.group(1).strip() if default_m else None,
+                "is_flag": is_bool,
+            })
+
+        commands.append({
+            "func_name": struct_name,
+            "command_name": struct_name,
+            "command_type": "struct",
+            "help": about_m.group(1) if about_m else None,
+            "options": options,
+            "arguments": [],
+            "file": filepath,
+        })
+
+    return commands
+
+
+# ─── Rust: serde Deserialize request structs ──────────────────────────────────
+
+def extract_serde_commands(source, filepath):
+    commands = []
+
+    struct_pattern = re.compile(
+        r"#\[derive\([^)]*Deserialize[^)]*\)\]\s*"
+        r"(?:pub\s+)?struct\s+(\w+)\s*\{"
+        r"([^}]*)\}",
+        re.DOTALL,
+    )
+
+    request_hints = {"request", "params", "args", "config", "input", "options", "query", "payload"}
+
+    for sm in struct_pattern.finditer(source):
+        struct_name = sm.group(1)
+        body = sm.group(2)
+
+        name_lower = struct_name.lower()
+        if not any(h in name_lower for h in request_hints):
+            continue
+
+        options = []
+        for fm in re.finditer(r"(?:pub\s+)?(\w+)\s*:\s*([^,\n]+)", body):
+            field_name = fm.group(1)
+            field_type = fm.group(2).strip().rstrip(",")
+
+            is_bool = field_type.strip() in ("bool", "Bool")
+
+            options.append({
+                "kind": "field",
+                "flags": [],
+                "dest": field_name,
+                "name": field_name,
+                "type": field_type,
+                "help": None,
+                "default": None,
+                "is_flag": is_bool,
+            })
+
+        if options:
+            commands.append({
+                "func_name": struct_name,
+                "command_name": struct_name,
+                "command_type": "struct",
+                "help": None,
+                "options": options,
+                "arguments": [],
+                "file": filepath,
+            })
+
+    return commands
+
+
+# ─── Binary name detection ────────────────────────────────────────────────────
+
+def detect_binary_names(root):
+    """Detect the installed binary/command names from project metadata files."""
+    root = Path(root)
+    binaries = []
+
+    # Python: setup.py console_scripts
+    for setup_py in root.rglob("setup.py"):
+        if any(part.startswith(".") for part in setup_py.relative_to(root).parts):
+            continue
+        try:
+            source = setup_py.read_text(encoding="utf-8")
+            # Match: "name = module.path:func"
+            for m in re.finditer(r"""['"](\w[\w-]*)\s*=\s*[\w.]+:[\w]+['"]""", source):
+                binaries.append({"name": m.group(1), "source": "setup.py console_scripts"})
+        except (UnicodeDecodeError, OSError):
+            pass
+
+    # Python: pyproject.toml [project.scripts]
+    for pyproject in root.rglob("pyproject.toml"):
+        if any(part.startswith(".") for part in pyproject.relative_to(root).parts):
+            continue
+        try:
+            source = pyproject.read_text(encoding="utf-8")
+            in_scripts = False
+            for line in source.splitlines():
+                stripped = line.strip()
+                if re.match(r"\[project\.scripts\]|\[tool\.poetry\.scripts\]", stripped):
+                    in_scripts = True
+                    continue
+                if in_scripts:
+                    if stripped.startswith("["):
+                        break
+                    m = re.match(r"""(\w[\w-]*)\s*=\s*['"]""", stripped)
+                    if m:
+                        binaries.append({"name": m.group(1), "source": "pyproject.toml scripts"})
+        except (UnicodeDecodeError, OSError):
+            pass
+
+    # Rust: Cargo.toml [[bin]] or package name with src/main.rs
+    for cargo in root.rglob("Cargo.toml"):
+        if any(part.startswith(".") for part in cargo.relative_to(root).parts):
+            continue
+        try:
+            source = cargo.read_text(encoding="utf-8")
+            # [[bin]] sections
+            for m in re.finditer(r'\[\[bin\]\][^[]*?name\s*=\s*"([^"]+)"', source, re.DOTALL):
+                binaries.append({"name": m.group(1), "source": "Cargo.toml [[bin]]"})
+            # If there's a src/main.rs next to this Cargo.toml, the package name is the binary
+            if (cargo.parent / "src" / "main.rs").exists():
+                pkg_m = re.search(r'\[package\]\s*\n(?:.*\n)*?name\s*=\s*"([^"]+)"', source)
+                if pkg_m:
+                    binaries.append({"name": pkg_m.group(1), "source": "Cargo.toml package"})
+        except (UnicodeDecodeError, OSError):
+            pass
+
+    return binaries
+
+
+def detect_project_info(root):
+    """Detect project metadata: name, install method, image, requirements."""
+    root = Path(root)
+    info = {
+        "name": None,
+        "install_commands": [],
+        "has_requirements_txt": False,
+        "language": None,
+    }
+
+    # Check for requirements.txt
+    for req in root.rglob("requirements.txt"):
+        if any(part.startswith(".") for part in req.relative_to(root).parts):
+            continue
+        info["has_requirements_txt"] = True
+        break
+
+    # Python: setup.py
+    for setup_py in root.rglob("setup.py"):
+        if any(part.startswith(".") for part in setup_py.relative_to(root).parts):
+            continue
+        try:
+            source = setup_py.read_text(encoding="utf-8")
+            name_m = re.search(r"""name\s*=\s*['"]([^'"]+)['"]""", source)
+            if name_m:
+                info["name"] = name_m.group(1)
+            info["language"] = "python"
+            info["image"] = "python"
+            # Check if it has rust extensions
+            if "setuptools-rust" in source or "RustExtension" in source:
+                info["install_commands"].append("apt install -qy cargo rustc")
+            if info["has_requirements_txt"]:
+                info["install_commands"].append("pip install -r requirements.txt")
+            info["install_commands"].append("pip install .")
+        except (UnicodeDecodeError, OSError):
+            pass
+        break
+
+    # Python: pyproject.toml
+    if not info["name"]:
+        for pyproject in root.rglob("pyproject.toml"):
+            if any(part.startswith(".") for part in pyproject.relative_to(root).parts):
+                continue
+            try:
+                source = pyproject.read_text(encoding="utf-8")
+                name_m = re.search(r"""name\s*=\s*['"]([^'"]+)['"]""", source)
+                if name_m:
+                    info["name"] = name_m.group(1)
+                info["language"] = "python"
+                if info["has_requirements_txt"]:
+                    info["install_commands"].append("pip install -r requirements.txt")
+                # Check build system
+                if "setuptools-rust" in source or "maturin" in source:
+                    info["install_commands"].insert(0, "apt install -qy cargo rustc")
+                info["install_commands"].append("pip install .")
+            except (UnicodeDecodeError, OSError):
+                pass
+            break
+
+    # Rust: Cargo.toml (if no Python project found)
+    if not info["name"]:
+        for cargo in root.rglob("Cargo.toml"):
+            if any(part.startswith(".") for part in cargo.relative_to(root).parts):
+                continue
+            try:
+                source = cargo.read_text(encoding="utf-8")
+                pkg_m = re.search(r'\[package\]\s*\n(?:.*\n)*?name\s*=\s*"([^"]+)"', source)
+                if pkg_m:
+                    info["name"] = pkg_m.group(1)
+                info["language"] = "rust"
+                info["install_commands"].append("cargo build --release")
+            except (UnicodeDecodeError, OSError):
+                pass
+            break
+
+    if not info["name"]:
+        info["name"] = root.name
+
+    return info
+
+
+# ─── Scanning logic ───────────────────────────────────────────────────────────
+
+def scan_python_file(filepath):
+    try:
+        source = filepath.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return []
+
+    commands = []
+    rel = str(filepath)
+
+    if "click" in source:
+        commands.extend(extract_click_commands(source, rel))
+    if "argparse" in source or "add_argument" in source:
+        commands.extend(extract_argparse_commands(source, rel))
+
+    return commands
+
+
+def scan_rust_file(filepath):
+    try:
+        source = filepath.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return []
+
+    commands = []
+    rel = str(filepath)
+
+    if "Parser" in source or "Args" in source or "clap" in source:
+        commands.extend(extract_clap_commands(source, rel))
+    if "Deserialize" in source:
+        commands.extend(extract_serde_commands(source, rel))
+
+    return commands
+
+
+def scan_directory(root):
+    root_path = Path(root).resolve()
+    if not root_path.exists():
+        print(f"Error: path '{root_path}' does not exist.", file=sys.stderr)
+        sys.exit(1)
+
+    all_commands = []
+
+    for path in sorted(root_path.rglob("*")):
+        if not path.is_file():
+            continue
+        if any(part.startswith(".") for part in path.relative_to(root_path).parts):
+            continue
+
+        if path.suffix == ".py":
+            all_commands.extend(scan_python_file(path))
+        elif path.suffix == ".rs":
+            all_commands.extend(scan_rust_file(path))
+
+    # Try class-based argparse extraction (multi-file, handles satori-cli style)
+    class_commands = extract_argparse_class_commands(root)
+    if class_commands:
+        all_commands.extend(class_commands)
+
+    return all_commands
+
+
+# ─── Mockup value generation ─────────────────────────────────────────────────
+
+def _infer_mockup_value(param):
+    """Infer a realistic mockup value from the param's type, default, help, and name."""
+    type_raw = param.get("type") or ""
+    type_str = type_raw.lower()
+    default = param.get("default")
+    name = (param.get("dest") or param.get("name") or "").lower()
+    help_text = (param.get("help") or "").lower()
+
+    # If there's a Choice/enum with literal values, pick the first one
+    choice_m = re.search(r"choice\s*\(\s*\[([^\]]+)\]", type_str, re.IGNORECASE)
+    if choice_m:
+        # Extract from the original (non-lowered) type to preserve case
+        choice_m_raw = re.search(r"choice\s*\(\s*\[([^\]]+)\]", type_raw, re.IGNORECASE)
+        raw_section = choice_m_raw.group(1) if choice_m_raw else choice_m.group(1)
+        items = re.findall(r"""['"]([^'"]+)['"]""", raw_section)
+        if items:
+            return items[0]
+
+    # If there's a usable default that isn't False/None/empty
+    if default and default not in ("None", "False", "True", "''", '""', "0"):
+        return default.strip("'\"")
+
+    # Detect path-like params
+    if "path" in type_str or "path" in name or "file" in name or "dir" in name:
+        return "./file.txt"
+
+    # Detect URL params
+    if "url" in name or "url" in help_text:
+        return "https://example.com"
+
+    # Detect numeric types
+    if type_str in ("int", "i32", "i64", "u32", "u64", "usize", "isize"):
+        return "1"
+    if type_str in ("float", "f32", "f64"):
+        return "1.0"
+    if "number" in name or "count" in name or "port" in name or "size" in name:
+        return "1"
+
+    # Rust types
+    if "string" in type_str or type_str == "str":
+        return _name_to_mockup(name)
+
+    if "option<string>" in type_str:
+        return _name_to_mockup(name)
+
+    if "bool" in type_str:
+        return "true"
+
+    # Python str
+    if type_str == "str":
+        return _name_to_mockup(name)
+
+    # Fallback: infer from the name
+    return _name_to_mockup(name)
+
+
+def _name_to_mockup(name):
+    """Generate a sensible mockup value from a parameter/field name."""
+    name = name.lower()
+    if "path" in name or "file" in name or "dir" in name or "config" in name:
+        return "./file.txt"
+    if "url" in name or "uri" in name or "repo" in name:
+        return "https://example.com"
+    if "port" in name:
+        return "8080"
+    if "host" in name:
+        return "localhost"
+    if "name" in name:
+        return "example"
+    if "format" in name:
+        return "json"
+    if "level" in name or "severity" in name:
+        return "LOW"
+    if "output" in name:
+        return "./output.txt"
+    if "input" in name:
+        return "./input.txt"
+    return "value"
+
+
+def _var_name(param):
+    """Derive a UPPER_CASE variable name for a param."""
+    name = param.get("dest") or param.get("name")
+    if not name:
+        flags = param.get("flags", [])
+        if flags:
+            longest = max(flags, key=len).lstrip("-")
+            name = longest
+        else:
+            name = "PARAM"
+    return name.upper().replace("-", "_")
+
+
+# ─── Satori playbook output ──────────────────────────────────────────────────
+
+def _cmd_label(cmd):
+    """Get the best CLI-facing name for a command."""
+    return cmd.get("cli_path") or cmd.get("command_name") or cmd.get("func_name") or "main"
+
+
+def _build_cmd_line(cmd):
+    """Build a single command execution string with ${{VAR}} refs."""
+    options = cmd.get("options", [])
+    arguments = cmd.get("arguments", [])
+
+    flag_opts = [o for o in options if o.get("is_flag")]
+    value_opts = [o for o in options if not o.get("is_flag")]
+
+    cmd_name = _cmd_label(cmd)
+    parts = [cmd_name]
+
+    # Positional arguments
+    for p in arguments:
+        parts.append(f"${{{{{_var_name(p)}}}}}")
+
+    # Value-bearing options
+    for p in value_opts:
+        vname = _var_name(p)
+        pflags = p.get("flags", [])
+        if pflags:
+            long_flags = [f for f in pflags if f.startswith("--")]
+            best_flag = long_flags[0] if long_flags else pflags[0]
+            parts.append(f"{best_flag}=${{{{{vname}}}}}")
+        else:
+            parts.append(f"--{p.get('name', vname.lower())}=${{{{{vname}}}}}")
+
+    # Boolean flags
+    for p in flag_opts:
+        pflags = p.get("flags", [])
+        if pflags:
+            long_flags = [f for f in pflags if f.startswith("--")]
+            parts.append(long_flags[0] if long_flags else pflags[0])
+
+    return " ".join(parts)
+
+
+def _resolve_binary(cmd, py_bins, rs_bins):
+    """Determine the binary name for a command."""
+    cmd_type = cmd.get("command_type")
+    cli_path = _cmd_label(cmd)
+    if cmd_type == "struct":
+        return rs_bins[0] if rs_bins else cli_path
+    return py_bins[0] if py_bins else cli_path
+
+
+def _number_variables(all_commands):
+    """Assign a consecutive number to each variable across all commands.
+    Returns numbered_vars: {original_vname -> (numbered_vname, numbered_mockup, comment)}
+    and updates each param in-place with a '_numbered_var' key."""
+    numbered_vars = {}
+    counter = 1
+
+    for cmd in all_commands:
+        options = cmd.get("options", [])
+        arguments = cmd.get("arguments", [])
+        value_opts = [o for o in options if not o.get("is_flag")]
+
+        for p in arguments + value_opts:
+            vname = _var_name(p)
+            if vname in numbered_vars:
+                p["_numbered_var"] = numbered_vars[vname][0]
+                continue
+            mockup = _infer_mockup_value(p)
+            numbered_vname = f"{vname}{counter}"
+            # Only append number to free-form string mockups where it
+            # makes sense as a unique identifier. Leave everything else as-is:
+            # choices, booleans, numbers, arrays, defaults from source.
+            numberable = {
+                "./file.txt", "./output.txt", "./input.txt",
+                "https://example.com", "localhost",
+                "example", "value", "json",
+            }
+            if mockup in numberable:
+                numbered_mockup = f"{mockup}{counter}"
+            else:
+                numbered_mockup = mockup
+            comment_parts = []
+            if p.get("help"):
+                comment_parts.append(p["help"])
+            if p.get("type"):
+                comment_parts.append(p["type"])
+            comment = "; ".join(comment_parts) if comment_parts else None
+            numbered_vars[vname] = (numbered_vname, numbered_mockup, comment)
+            p["_numbered_var"] = numbered_vname
+            counter += 1
+
+    return numbered_vars
+
+
+def generate_satori_output(all_commands, binaries, project_info):
+    """Generate a single Satori playbook with proper input format."""
+
+    py_bins = [b["name"] for b in binaries if "Cargo" not in b["source"]]
+    rs_bins = [b["name"] for b in binaries if "Cargo" in b["source"]]
+
+    numbered_vars = _number_variables(all_commands)
+
+    lines = []
+
+    # Settings
+    proj_name = project_info.get("name") or "unknown"
+    lines.append(f"# satori run params.yml --repo account/repository --output")
+    lines.append("settings:")
+    lines.append(f'  name: "{proj_name} params"')
+    lines.append("  image: satori")
+    lines.append("")
+
+    # Install
+    if project_info.get("install_commands"):
+        lines.append("install:")
+        for cmd in project_info["install_commands"]:
+            lines.append(f"  - {cmd}")
+        lines.append("")
+
+    # Input variables — Satori format: nested list under each var name
+    if numbered_vars:
+        for _orig, (n_vname, n_mockup, comment) in numbered_vars.items():
+            if comment:
+                lines.append(f"# {comment}")
+            lines.append(f"{n_vname}:")
+            lines.append(f'  - - "{n_mockup}"')
+        lines.append("")
+
+    # Executions
+    lines.append("executions:")
+    lines.append("  assertReturnCode: 0")
+
+    used_keys = {}  # track used YAML keys to avoid duplicates
+    for cmd in all_commands:
+        options = cmd.get("options", [])
+        arguments = cmd.get("arguments", [])
+
+        flag_opts = [o for o in options if o.get("is_flag")]
+        value_opts = [o for o in options if not o.get("is_flag")]
+
+        if not value_opts and not flag_opts and not arguments:
+            continue
+
+        binary = _resolve_binary(cmd, py_bins, rs_bins)
+        cli_path = _cmd_label(cmd)
+        cmd_type = cmd.get("command_type")
+
+        if cmd_type == "struct":
+            full_cmd = binary
+        else:
+            full_cmd = f"{binary} {cli_path}"
+
+        # Build command line with numbered vars
+        parts = [full_cmd]
+
+        for p in arguments:
+            n_var = p.get("_numbered_var", _var_name(p))
+            parts.append(f"${{{{{n_var}}}}}")
+
+        for p in value_opts:
+            n_var = p.get("_numbered_var", _var_name(p))
+            pflags = p.get("flags", [])
+            if pflags:
+                long_flags = [f for f in pflags if f.startswith("--")]
+                best_flag = long_flags[0] if long_flags else pflags[0]
+                parts.append(f"{best_flag}=${{{{{n_var}}}}}")
+            else:
+                parts.append(f"--{p.get('name', n_var.lower())}=${{{{{n_var}}}}}")
+
+        for p in flag_opts:
+            pflags = p.get("flags", [])
+            if pflags:
+                long_flags = [f for f in pflags if f.startswith("--")]
+                parts.append(long_flags[0] if long_flags else pflags[0])
+
+        # YAML keys can't have spaces, replace with underscores
+        yaml_key = cli_path.replace(" ", "_")
+        # Avoid duplicate YAML keys by appending a number
+        if yaml_key in used_keys:
+            used_keys[yaml_key] += 1
+            yaml_key = f"{yaml_key}_{used_keys[yaml_key]}"
+        else:
+            used_keys[yaml_key] = 1
+        lines.append(f"  {yaml_key}:")
+        lines.append(f"    - {' '.join(parts)}")
+
+    return "\n".join(lines), numbered_vars
+
+
+def generate_tentative_sh(all_commands, binaries, numbered_vars):
+    """Generate a .sh script with full tentative execution lines using numbered values."""
+    lines = ["#!/bin/bash", ""]
+
+    py_bins = [b["name"] for b in binaries if "Cargo" not in b["source"]]
+    rs_bins = [b["name"] for b in binaries if "Cargo" in b["source"]]
+
+    # Build lookup: numbered_vname -> numbered_mockup
+    mockup_lookup = {n_vname: n_mockup for _orig, (n_vname, n_mockup, _c) in numbered_vars.items()}
+
+    for cmd in all_commands:
+        options = cmd.get("options", [])
+        arguments = cmd.get("arguments", [])
+
+        flag_opts = [o for o in options if o.get("is_flag")]
+        value_opts = [o for o in options if not o.get("is_flag")]
+
+        if not value_opts and not flag_opts and not arguments:
+            continue
+
+        cmd_type = cmd.get("command_type")
+        cli_path = _cmd_label(cmd)
+        binary = _resolve_binary(cmd, py_bins, rs_bins)
+
+        if cmd_type == "struct":
+            prefix = binary
+        else:
+            prefix = f"{binary} {cli_path}"
+
+        parts = [prefix]
+
+        for p in arguments:
+            n_var = p.get("_numbered_var", _var_name(p))
+            parts.append(mockup_lookup.get(n_var, _infer_mockup_value(p)))
+
+        for p in value_opts:
+            n_var = p.get("_numbered_var", _var_name(p))
+            mockup = mockup_lookup.get(n_var, _infer_mockup_value(p))
+            pflags = p.get("flags", [])
+            if pflags:
+                long_flags = [f for f in pflags if f.startswith("--")]
+                best_flag = long_flags[0] if long_flags else pflags[0]
+                parts.append(f"{best_flag}={mockup}")
+            else:
+                parts.append(f"--{p.get('name', 'param')}={mockup}")
+
+        for p in flag_opts:
+            pflags = p.get("flags", [])
+            if pflags:
+                long_flags = [f for f in pflags if f.startswith("--")]
+                parts.append(long_flags[0] if long_flags else pflags[0])
+
+        lines.append(" ".join(parts))
+
+    return "\n".join(lines)
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: params <directory>", file=sys.stderr)
+        sys.exit(1)
+
+    target = sys.argv[1]
+    commands = scan_directory(target)
+    binaries = detect_binary_names(target)
+    project_info = detect_project_info(target)
+
+    if not commands:
+        print("No parameters found.")
+        sys.exit(0)
+
+    if "--json" in sys.argv:
+        print(json.dumps(commands, indent=2, default=str))
+        sys.exit(0)
+
+    # Write .yml (Satori playbook)
+    yml_content, numbered_vars = generate_satori_output(commands, binaries, project_info)
+    yml_path = Path("params.yml")
+    yml_path.write_text(yml_content + "\n", encoding="utf-8")
+
+    # Write .sh (tentative execution)
+    sh_content = generate_tentative_sh(commands, binaries, numbered_vars)
+    sh_path = Path("params.sh")
+    sh_path.write_text(sh_content + "\n", encoding="utf-8")
+    sh_path.chmod(0o755)
+
+    print(f"Wrote {yml_path} and {sh_path}")
+    print()
+    print("Execute with:")
+    print(f"  satori run params.yml --repo account/repository --output")
+
+
+if __name__ == "__main__":
+    main()
